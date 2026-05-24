@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import com.example.data.model.SshSnippet
 import com.example.ssh.SftpFile
 import com.example.ssh.SshSessionTab
+import com.example.ssh.TerminalBufferProcessor
 import com.example.ui.theme.TerminalTheme
 import com.example.ui.viewmodel.SshViewModel
 import kotlinx.coroutines.delay
@@ -259,8 +260,7 @@ fun ConsolePanel(
                 // Large item count emulation safely
                 items(lines.size) { index ->
                     Text(
-                        text = lines[index],
-                        color = theme.textPrimary,
+                        text = TerminalBufferProcessor.parseAnsiToAnnotatedString(lines[index], theme.textPrimary),
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
                         lineHeight = 16.sp,

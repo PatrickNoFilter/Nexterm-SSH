@@ -171,7 +171,8 @@ class SshSessionManager {
                                 val cappedBuffer = if (current.terminalBuffer.length > 50000) {
                                     current.terminalBuffer.takeLast(30000)
                                 } else current.terminalBuffer
-                                current.copy(terminalBuffer = cappedBuffer + chunk)
+                                val processedBuffer = TerminalBufferProcessor.processChunk(cappedBuffer, chunk)
+                                current.copy(terminalBuffer = processedBuffer)
                             }
                         }
                     } else {
