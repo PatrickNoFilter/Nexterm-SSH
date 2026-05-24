@@ -9,12 +9,30 @@ import androidx.compose.ui.text.style.TextDecoration
 
 object TerminalBufferProcessor {
 
+    private val states = java.util.concurrent.ConcurrentHashMap<String, TerminalState>()
+
+    class TerminalState {
+        var charSetG0: Char = 'B'       // 'B' = US ASCII, '0' = Special Graphics
+        var charSetG1: Char = 'B'       // 'B' = US ASCII, '0' = Special Graphics
+        var activeCharSet: Int = 0      // 0 for G0, 1 for G1
+        var pendingCarriageReturn: Boolean = false
+    }
+
+    /**
+     * Clears cached state data for a tab upon disconnection or closure.
+     */
+    fun clearState(tabId: String) {
+        states.remove(tabId)
+    }
+
     /**
      * Cleans an incoming SSH raw text chunk, handles backspaces/carriage returns/clear screen triggers,
      * strips unnecessary VT100 control sequences, and keeps styling escape sequences in place
      * for visual processing.
+     * Keeps track of active VT100 G0/G1 character sets & SO/SI switches to translate box borders properly.
      */
-    fun processChunk(currentBuffer: String, chunk: String): String {
+    fun processChunk(tabId: String, currentBuffer: String, chunk: String): String {
+        val state = states.computeIfAbsent(tabId) { TerminalState() }
         val sb = StringBuilder()
         sb.append(currentBuffer)
 
@@ -24,6 +42,14 @@ object TerminalBufferProcessor {
         while (i < len) {
             val c = chunk[i]
             when (c) {
+                '\u000e' -> { // Shift Out (SO) -> select G1 character set
+                    state.activeCharSet = 1
+                    i++
+                }
+                '\u000f' -> { // Shift In (SI) -> select G0 character set
+                    state.activeCharSet = 0
+                    i++
+                }
                 '\u0008', '\u007f' -> { // Backspace or Delete
                     if (sb.isNotEmpty() && sb.last() != '\n') {
                         sb.deleteAt(sb.length - 1)
@@ -31,19 +57,13 @@ object TerminalBufferProcessor {
                     i++
                 }
                 '\r' -> { // Carriage Return
-                    if (i + 1 < len && chunk[i + 1] == '\n') {
-                        // Let the '\n' at next index handle the line break
-                        i++
-                    } else {
-                        // Standalone carriage return wipes the active line
-                        val lastNewLine = sb.lastIndexOf('\n')
-                        if (lastNewLine != -1) {
-                            sb.setLength(lastNewLine + 1)
-                        } else {
-                            sb.setLength(0)
-                        }
-                        i++
-                    }
+                    state.pendingCarriageReturn = true
+                    i++
+                }
+                '\n' -> { // Newline
+                    state.pendingCarriageReturn = false
+                    sb.append('\n')
+                    i++
                 }
                 '\u001b' -> { // Escape Sequence
                     if (i + 1 < len) {
@@ -62,6 +82,7 @@ object TerminalBufferProcessor {
                                     when (tc) {
                                         'J' -> { // Clear screen sequence (e.g., [2J or [J)
                                             sb.setLength(0)
+                                            state.pendingCarriageReturn = false
                                         }
                                         'K' -> { // Erase line sequence (e.g., [K or [2K)
                                             val lastNewLine = sb.lastIndexOf('\n')
@@ -70,6 +91,7 @@ object TerminalBufferProcessor {
                                             } else {
                                                 sb.setLength(0)
                                             }
+                                            state.pendingCarriageReturn = false
                                         }
                                         'm' -> { // SGR (Select Graphic Rendition) - KEEP for colors!
                                             sb.append(code)
@@ -100,6 +122,19 @@ object TerminalBufferProcessor {
                             if (!foundEnd) {
                                 i = len
                             }
+                        } else if (next == '(' || next == ')' || next == '*' || next == '+') {
+                            // Character set designation sequences of form ESC ( C (3 characters total)
+                            if (i + 2 < len) {
+                                val designator = chunk[i + 2]
+                                if (next == '(') {
+                                    state.charSetG0 = designator
+                                } else if (next == ')') {
+                                    state.charSetG1 = designator
+                                }
+                                i += 3 // Consume all 3 characters cleanly!
+                            } else {
+                                i += 2 // Incomplete sequence across chunk, consume prefix
+                            }
                         } else {
                             // Simple Esc+char sequence (e.g. Esc=, Esc>) -> strip
                             i += 2
@@ -109,13 +144,61 @@ object TerminalBufferProcessor {
                     }
                 }
                 else -> {
-                    sb.append(c)
+                    // Check if we need to apply pending carriage return
+                    if (state.pendingCarriageReturn) {
+                        val lastNewLine = sb.lastIndexOf('\n')
+                        if (lastNewLine != -1) {
+                            sb.setLength(lastNewLine + 1)
+                        } else {
+                            sb.setLength(0)
+                        }
+                        state.pendingCarriageReturn = false
+                    }
+
+                    // Translate character if current character set is line drawing ('0')
+                    val translated = translateChar(c, state)
+                    sb.append(translated)
                     i++
                 }
             }
         }
 
         return sb.toString()
+    }
+
+    private fun translateChar(c: Char, state: TerminalState): Char {
+        val currentSet = if (state.activeCharSet == 0) state.charSetG0 else state.charSetG1
+        if (currentSet == '0') {
+            return when (c) {
+                '`' -> '◆' // diamond
+                'a' -> '▒' // checkerboard
+                'f' -> '°' // degree
+                'g' -> '±' // plus/minus
+                'j' -> '┘' // lower right corner
+                'k' -> '┐' // upper right corner
+                'l' -> '┌' // upper left corner
+                'm' -> '└' // lower left corner
+                'n' -> '┼' // crossing lines
+                'o' -> '⎺' // horizontal line 1
+                'p' -> '⎻' // horizontal line 2
+                'q' -> '─' // horizontal line 3
+                'r' -> '⎼' // horizontal line 4
+                's' -> '⎽' // horizontal line 5
+                't' -> '├' // left tee
+                'u' -> '┤' // right tee
+                'v' -> '┴' // bottom tee
+                'w' -> '┬' // top tee
+                'x' -> '│' // vertical line
+                'y' -> '≤'
+                'z' -> '≥'
+                '{' -> 'π'
+                '|' -> '≠'
+                '}' -> '£'
+                '~' -> '·'
+                else -> c
+            }
+        }
+        return c
     }
 
     /**
@@ -186,30 +269,28 @@ object TerminalBufferProcessor {
                             when (param) {
                                 1 -> currentWeight = FontWeight.Bold
                                 4 -> textDecoration = TextDecoration.Underline
-                                22 -> currentWeight = FontWeight.Normal // Normal color/intensity
-                                24 -> textDecoration = TextDecoration.None // Underline off
+                                22 -> currentWeight = FontWeight.Normal
+                                24 -> textDecoration = TextDecoration.None
                                 
                                 // Standard Foreground color codes
-                                30 -> currentColor = Color(0xFF2E3440) // Black (Nord styles)
-                                31 -> currentColor = Color(0xFFBF616A) // Red
-                                32 -> currentColor = Color(0xFFA3BE8C) // Green
-                                33 -> currentColor = Color(0xFFEBCB8B) // Yellow
-                                34 -> currentColor = Color(0xFF81A1C1) // Blue
-                                35 -> currentColor = Color(0xFFB48EAD) // Magenta
-                                36 -> currentColor = Color(0xFF88C0D0) // Cyan
-                                37 -> currentColor = Color(0xFFECEFF4) // White
+                                30 -> currentColor = Color(0xFF2E3440)
+                                31 -> currentColor = Color(0xFFBF616A)
+                                32 -> currentColor = Color(0xFFA3BE8C)
+                                33 -> currentColor = Color(0xFFEBCB8B)
+                                34 -> currentColor = Color(0xFF81A1C1)
+                                35 -> currentColor = Color(0xFFB48EAD)
+                                36 -> currentColor = Color(0xFF88C0D0)
+                                37 -> currentColor = Color(0xFFECEFF4)
                                 
                                 // Bright colors
-                                90 -> currentColor = Color(0xFF4C566A) // Bright Black (Gray)
-                                91 -> currentColor = Color(0xFFD08770) // Bright Red
-                                92 -> currentColor = Color(0xFFA3BE8C) // Bright Green (same or lighter)
-                                93 -> currentColor = Color(0xFFEBCB8B) // Bright Yellow
-                                94 -> currentColor = Color(0xFF5E81AC) // Bright Blue
-                                95 -> currentColor = Color(0xFFB48EAD) // Bright Magenta
-                                96 -> currentColor = Color(0xFF8FBCBB) // Bright Cyan
-                                97 -> currentColor = Color(0xFFE5E9F0) // Bright White
-                                
-                                // Background colors or secondary configurations are skipped for high readability
+                                90 -> currentColor = Color(0xFF4C566A)
+                                91 -> currentColor = Color(0xFFD08770)
+                                92 -> currentColor = Color(0xFFA3BE8C)
+                                93 -> currentColor = Color(0xFFEBCB8B)
+                                94 -> currentColor = Color(0xFF5E81AC)
+                                95 -> currentColor = Color(0xFFB48EAD)
+                                96 -> currentColor = Color(0xFF8FBCBB)
+                                97 -> currentColor = Color(0xFFE5E9F0)
                             }
                         }
                     }
