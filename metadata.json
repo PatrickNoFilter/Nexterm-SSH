@@ -1,0 +1,6 @@
+{
+  "name": "Nexterm SSH",
+  "description": "A powerful, multi-tabbed SSH & SFTP client with local encrypted credential synchronization, SSH key generation, and customized terminal themes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
